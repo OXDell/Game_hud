@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Game Hub</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon.png">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #0f121a;
+            touch-action: none; /* Отключаем скролл и зум на iOS */
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        // --- НАСТРОЙКИ И КОНСТАНТЫ ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        let WIDTH, HEIGHT;
+
+        function resize() {
+            WIDTH = window.innerWidth;
+            HEIGHT = window.innerHeight;
+            canvas.width = WIDTH;
+            canvas.height = HEIGHT;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        const BG_COLOR = "#0f121a";
+        const GRID_EMPTY = "#1e232e";
+        const GRID_BORDER = "#2a3242";
+        const SCORE_COLOR = "#f1c40f";
+        const OVERLAY_COLOR = "rgba(10, 12, 18, 0.86)";
+        const COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#9b59b6", "#e67e22"];
+
+        let currentState = "menu";
+        let lastTime = 0;
+
+        // --- АУДИО (Web Audio API) ---
+        let audioCtx;
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function playSound(type, linesCleared = 1) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            let freq = 110, dur = 0.025, decay = 15.0;
+            if (type === "click") { freq = 110; dur = 0.025; decay = 15.0; }
+            else if (type === "place") { freq = 85; dur = 0.04; decay = 12.0; }
+            else if (type === "clear") { freq = 160 + (linesCleared - 1) * 60; dur = 0.12 + (linesCleared - 1) * 0.03; decay = 6.0 - (linesCleared - 1) * 0.8; }
+            else if (type === "gameover") { freq = 55; dur = 0.35; decay = 4.0; }
+            else if (type === "win") { freq = 280; dur = 0.2; decay = 5.0; }
+
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.35, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+            
+            osc.start();
+            osc.stop(audioCtx.currentTime + dur);
+        }
+
+        // --- ИГРА 1: BLOCK BLAST ---
+        const GRID_SIZE = 8;
+        let CELL_SIZE = Math.floor((WIDTH * 0.85) / GRID_SIZE);
+        let GRID_OFFSET_X = (WIDTH - (GRID_SIZE * CELL_SIZE)) / 2;
+        let GRID_OFFSET_Y = HEIGHT * 0.16;
+
+        const SMALL_SHAPES = [[[1]], [[1,1]], [[1],[1],[1]]];
+        const BIG_SHAPES = [[[1,1],[1,1]], [[1,1,1],[0,1,0]], [[1,1,0],[0,1,1]], [[1,0,0],[1,1,1]], [[1,1,1],[1,1,1],[1,1,1]]];
+
+        let blockGrid = [], blockGridColors = [];
+        let score = 0, blockGameOver = false;
+        let particles = [], availablePieces = [], activePiece = null;
+        let isDragging = false;
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x; this.y = y; this.color = color;
+                this.vx = (Math.random() - 0.5) * 8;
+                this.vy = (Math.random() - 0.8) * 8;
+                this.alpha = 1; this.size = Math.random() * 3 + 4;
+            }
+            update() {
+                this.x += this.vx; this.y += this.vy; this.vy += 0.25; this.alpha -= 0.04;
+                if (this.size > 0.1) this.size -= 0.1;
+            }
+            draw() {
+                if (this.alpha > 0) {
+                    ctx.globalAlpha = this.alpha;
+                    ctx.fillStyle = this.color;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.globalAlpha = 1;
+                }
+            }
+        }
+
+        class Piece {
+            constructor(shape, color, slotIndex) {
+                this.shape = shape; this.color = color; this.slotIndex = slotIndex;
+                this.resetPosition();
+            }
+            resetPosition() {
+                this.rows = this.shape.length;
+                this.cols = this.shape[0].length;
+                this.displaySize = Math.floor(CELL_SIZE * 0.65);
+                this.width = this.cols * this.displaySize;
+                this.height = this.rows * this.displaySize;
+                this.slotWidth = WIDTH / 3;
+                this.x = this.slotWidth * this.slotIndex + (this.slotWidth / 2) - (this.width / 2);
+                this.y = HEIGHT * 0.76;
+            }
+            draw() {
+                let size = isDragging && activePiece === this ? CELL_SIZE : this.displaySize;
+                for (let r = 0; r < this.rows; r++) {
+                    for (let c = 0; c < this.cols; c++) {
+                        if (this.shape[r][c]) {
+                            let bx = this.x + c * size;
+                            let by = this.y + r * size;
+                            ctx.fillStyle = this.color;
+                            ctx.beginPath();
+                            ctx.roundRect(bx, by, size - 2, size - 2, 6);
+                            ctx.fill();
+                        }
+                    }
+                }
+            }
+        }
+
+        function spawnPieces() {
+            let pieces = [];
+            pieces.push(new Piece(SMALL_SHAPES[Math.floor(Math.random() * SMALL_SHAPES.length)], COLORS[Math.floor(Math.random() * COLORS.length)], 0));
+            for (let i = 1; i < 3; i++) {
+                let allShapes = SMALL_SHAPES.concat(BIG_SHAPES);
+                pieces.push(new Piece(allShapes[Math.floor(Math.random() * allShapes.length)], COLORS[Math.floor(Math.random() * COLORS.length)], i));
+            }
+            return pieces;
+        }
+
+        function checkGameOver() {
+            if (availablePieces.length === 0) return false;
+            for (let p of availablePieces) {
+                for (let gy = 0; gy <= GRID_SIZE - p.rows; gy++) {
+                    for (let gx = 0; gx <= GRID_SIZE - p.cols; gx++) {
+                        let fits = true;
+                        for (let r = 0; r < p.rows; r++) {
+                            for (let c = 0; c < p.cols; c++) {
+                                if (p.shape[r][c] && blockGrid[gy+r][gx+c] !== 0) {
+                                    fits = false; break;
+                                }
+                            }
+                            if (!fits) break;
+                        }
+                        if (fits) return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        function resetBlockGame() {
+            blockGrid = Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(0));
+            blockGridColors = Array(GRID_SIZE).fill().map(() => Array(GRID_SIZE).fill(null));
+            score = 0; blockGameOver = false; activePiece = null; particles = [];
+            availablePieces = spawnPieces();
+            playSound("place");
+        }
+
+        // --- ИГРА 2: ЗМЕЙКА ---
+        let snakeCell = Math.floor(WIDTH * 0.05);
+        let snakePos = [], snakeDir = "RIGHT", snakeFood = null, snakeScore = 0, snakeOver = false;
+        let swipeStart = null;
+
+        function resetSnake() {
+            let cols = Math.floor(WIDTH / snakeCell);
+            let rows = Math.floor((HEIGHT - HEIGHT * 0.12) / snakeCell);
+            let startX = Math.floor(cols / 2) * snakeCell;
+            let startY = Math.floor(rows / 2) * snakeCell;
+            snakePos = [[startX, startY], [startX - snakeCell, startY], [startX - 2 * snakeCell, startY]];
+            snakeDir = "RIGHT"; snakeScore = 0; snakeOver = false;
+            spawnSnakeFood();
+        }
+
+        function spawnSnakeFood() {
+            let cols = Math.floor(WIDTH / snakeCell);
+            let topLimit = Math.floor(HEIGHT * 0.12);
+            let bottomLimit = HEIGHT - Math.floor(HEIGHT * 0.1);
+            let rowsTop = Math.floor(topLimit / snakeCell) + 1;
+            let rowsBottom = Math.floor(bottomLimit / snakeCell) - 1;
+            let rx = Math.floor(Math.random() * (cols - 2)) * snakeCell;
+            let ry = Math.floor(rowsTop + Math.random() * (rowsBottom - rowsTop)) * snakeCell;
+            snakeFood = [rx, ry];
+        }
+
+        // --- ИГРА 3: СУЕФА ---
+        const suiefaChoices = ["КАМЕНЬ", "НОЖНИЦЫ", "БУМАГА"];
+        let suiefaPlayerScore = 0, suiefaBotScore = 0, suiefaStatusText = "Игра до 3 побед", suiefaResultText = "", suiefaOver = false;
+
+        // --- ИГРА 4: СОЕДИНИ ЛИНИЯМИ ---
+        const FLOW_GRID = 7;
+        let flowCell = Math.floor((WIDTH * 0.85) / FLOW_GRID);
+        let flowOffsetX = (WIDTH - (FLOW_GRID * flowCell)) / 2;
+        let flowOffsetY = HEIGHT * 0.16;
+        const FLOW_COLORS = ["#3498db", "#e74c3c", "#2ecc71", "#f1c40f", "#9b59b6"];
+        let flowPairs = [], flowOriginalPairs = [], flowPaths = [];
+        let flowActiveColor = null, flowActivePath = [], flowWon = false;
+
+        function resetFlowGame() {
+            flowPaths = Array(FLOW_COLORS.length).fill().map(() => []);
+            flowActiveColor = null; flowActivePath = []; flowWon = false; flowPairs = [];
+            let board = Array(FLOW_GRID).fill().map(() => Array(FLOW_GRID).fill(-1));
+
+            for (let colorIdx = 0; colorIdx < FLOW_COLORS.length; colorIdx++) {
+                let freeCells = [];
+                for (let r = 0; r < FLOW_GRID; r++) for (let c = 0; c < FLOW_GRID; c++) if (board[r][c] === -1) freeCells.push([r, c]);
+                if (freeCells.length === 0) break;
+
+                let startPos = freeCells[Math.floor(Math.random() * freeCells.length)];
+                let path = [startPos];
+                board[startPos[0]][startPos[1]] = colorIdx;
+                let targetLen = Math.floor(Math.random() * 3) + 3;
+
+                for (let step = 0; step < targetLen - 1; step++) {
+                    let curr = path[path.length - 1];
+                    let neighbors = [];
+                    [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr, dc]) => {
+                        let nr = curr[0] + dr, nc = curr[1] + dc;
+                        if (nr >= 0 && nr < FLOW_GRID && nc >= 0 && nc < FLOW_GRID && board[nr][nc] === -1) neighbors.push([nr, nc]);
+                    });
+                    if (neighbors.length === 0) break;
+                    let nextCell = neighbors[Math.floor(Math.random() * neighbors.length)];
+                    path.push(nextCell);
+                    board[nextCell[0]][nextCell[1]] = colorIdx;
+                }
+                flowPairs.push([path[0], path[path.length - 1]]);
+            }
+            flowOriginalPairs = JSON.parse(JSON.stringify(flowPairs));
+        }
+
+        function restartCurrentFlowLevel() {
+            flowPaths = Array(FLOW_COLORS.length).fill().map(() => []);
+            flowActiveColor = null; flowActivePath = []; flowWon = false;
+            flowPairs = JSON.parse(JSON.stringify(flowOriginalPairs));
+        }
+
+        // --- ИГРА 5: КРЕСТИКИ-НОЛИКИ ---
+        const TIC_SIZE = 3;
+        let ticCell = Math.floor((WIDTH * 0.6) / TIC_SIZE);
+        let ticOffsetX = (WIDTH - (TIC_SIZE * ticCell)) / 2;
+        let ticOffsetY = HEIGHT * 0.22;
+        let ticBoard = [], ticTurn = "X", ticOver = false, ticWinner = "";
+
+        function resetTic() {
+            ticBoard = Array(TIC_SIZE).fill().map(() => Array(TIC_SIZE).fill(""));
+            ticTurn = "X"; ticOver = false; ticWinner = "";
+        }
+
+        function checkTicWinner(board) {
+            for (let i = 0; i < 3; i++) {
+                if (board[i][0] === board[i][1] && board[i][1] === board[i][2] && board[i][0] !== "") return board[i][0];
+                if (board[0][i] === board[1][i] && board[1][i] === board[2][i] && board[0][i] !== "") return board[0][i];
+            }
+            if (board[0][0] === board[1][1] && board[1][1] === board[2][2] && board[0][0] !== "") return board[0][0];
+            if (board[0][2] === board[1][1] && board[1][1] === board[2][0] && board[0][2] !== "") return board[0][2];
+            if (board.every(row => row.every(cell => cell !== ""))) return "НИЧЬЯ";
+            return "";
+        }
+
+        function botMove() {
+            for (let symbol of ["O", "X"]) {
+                for (let i = 0; i < 3; i++) {
+                    for (let j = 0; j < 3; j++) {
+                        if (ticBoard[i][j] === "") {
+                            ticBoard[i][j] = symbol;
+                            if (checkTicWinner(ticBoard) === symbol) {
+                                if (symbol === "O") return;
+                                else ticBoard[i][j] = "";
+                            } else ticBoard[i][j] = "";
+                        }
+                    }
+                }
+            }
+            let empty = [];
+            for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) if (ticBoard[i][j] === "") empty.push([i, j]);
+            if (empty.length > 0) {
+                let [i, j] = empty[Math.floor(Math.random() * empty.length)];
+                ticBoard[i][j] = "O";
+            }
+        }
+
+        // --- ВВОД (Мышь и Тач) ---
+        function handleInputStart(x, y) {
+            initAudio();
+            if (currentState === "menu") {
+                if (y > HEIGHT * 0.4 && y < HEIGHT * 0.49) { resetBlockGame(); currentState = "block"; playSound("click"); }
+                else if (y > HEIGHT * 0.55 && y < HEIGHT * 0.64) { currentState = "games_menu"; playSound("click"); }
+            } else if (currentState === "games_menu") {
+                if (y > HEIGHT * 0.22 && y < HEIGHT * 0.30) { resetSnake(); currentState = "snake"; playSound("click"); }
+                else if (y > HEIGHT * 0.33 && y < HEIGHT * 0.41) { suiefaPlayerScore = 0; suiefaBotScore = 0; suiefaStatusText = "Игра до 3 побед"; suiefaResultText = ""; suiefaOver = false; currentState = "suiefa"; playSound("click"); }
+                else if (y > HEIGHT * 0.44 && y < HEIGHT * 0.52) { resetFlowGame(); currentState = "line"; playSound("click"); }
+                else if (y > HEIGHT * 0.55 && y < HEIGHT * 0.63) { resetTic(); currentState = "tictactoe"; playSound("click"); }
+                else if (y > HEIGHT * 0.72 && y < HEIGHT * 0.79) { currentState = "menu"; playSound("click"); }
+            } else if (currentState === "block") {
+                if (blockGameOver) { resetBlockGame(); return; }
+                if (y < HEIGHT * 0.05 && x < WIDTH * 0.2) { currentState = "menu"; return; }
+                for (let p of availablePieces) {
+                    if (x >= p.x - 50 && x <= p.x + p.width + 50 && y >= p.y - 50 && y <= p.y + p.height + 50) {
+                        activePiece = p; isDragging = true;
+                        activePiece.x = x - (activePiece.cols * CELL_SIZE) / 2;
+                        activePiece.y = y - (activePiece.rows * CELL_SIZE) / 2 - 95;
+                        playSound("click");
+                        break;
+                    }
+                }
+            } else if (currentState === "snake") {
+                if (snakeOver) { resetSnake(); return; }
+                if (y < HEIGHT * 0.06 && x < WIDTH * 0.22) { currentState = "games_menu"; return; }
+                swipeStart = {x, y};
+            } else if (currentState === "suiefa") {
+                if (y < HEIGHT * 0.06 && x < WIDTH * 0.22) { currentState = "games_menu"; return; }
+                if (suiefaOver && y > HEIGHT * 0.8 && y < HEIGHT * 0.87) {
+                    suiefaPlayerScore = 0; suiefaBotScore = 0; suiefaStatusText = "Игра до 3 побед"; suiefaResultText = ""; suiefaOver = false; playSound("click"); return;
+                }
+                if (!suiefaOver) {
+                    for (let i = 0; i < 3; i++) {
+                        let by = HEIGHT * 0.48 + i * HEIGHT * 0.09;
+                        if (y > by && y < by + HEIGHT * 0.07) {
+                            playSound("click");
+                            let botChoice = suiefaChoices[Math.floor(Math.random() * 3)];
+                            suiefaStatusText = `Бот выбрал: ${botChoice}`;
+                            let choice = suiefaChoices[i];
+                            if (choice === botChoice) suiefaResultText = "НИЧЬЯ!";
+                            else if ((choice === "КАМЕНЬ" && botChoice === "НОЖНИЦЫ") || (choice === "НОЖНИЦЫ" && botChoice === "БУМАГА") || (choice === "БУМАГА" && botChoice === "КАМЕНЬ")) {
+                                suiefaResultText = "ВЫ ВЫИГРАЛИ РАУНД!"; suiefaPlayerScore++;
+                            } else {
+                                suiefaResultText = "БОТ ВЫИГРАЛ РАУНД!"; suiefaBotScore++;
+                            }
+                            if (suiefaPlayerScore === 3) { suiefaResultText = "ПОБЕДА В МАТЧЕ! 🎉"; suiefaOver = true; playSound("win"); }
+                            else if (suiefaBotScore === 3) { suiefaResultText = "БОТ ВЫИГРАЛ МАТЧ! 💥"; suiefaOver = true; playSound("gameover"); }
+                            break;
+                        }
+                    }
+                }
+            } else if (currentState === "line") {
+                if (flowWon) { resetFlowGame(); playSound("click"); return; }
+                if (y < HEIGHT * 0.06 && x < WIDTH * 0.22) { currentState = "games_menu"; return; }
+                if (x > WIDTH - WIDTH * 0.4 && x < WIDTH - WIDTH * 0.22 && y > HEIGHT * 0.02 && y < HEIGHT * 0.07) { restartCurrentFlowLevel(); playSound("click"); return; }
+                if (x > WIDTH - WIDTH * 0.2 && x < WIDTH && y > HEIGHT * 0.02 && y < HEIGHT * 0.07) { resetFlowGame(); playSound("click"); return; }
+
+                let gx = Math.floor((x - flowOffsetX) / flowCell);
+                let gy = Math.floor((y - flowOffsetY) / flowCell);
+                if (gx >= 0 && gx < FLOW_GRID && gy >= 0 && gy < FLOW_GRID) {
+                    let cell = [gx, gy];
+                    let alreadyEnd = flowPaths.some((path, i) => path.length >= 2 && path[path.length - 1][0] === gx && path[path.length - 1][1] === gy);
+                    if (!alreadyEnd) {
+                        for (let i = 0; i < flowPairs.length; i++) {
+                            let start = flowPairs[i][0], end = flowPairs[i][1];
+                            if (flowPaths[i].length === 0) {
+                                if (cell[0] === start[0] && cell[1] === start[1]) { flowActiveColor = i; flowActivePath = [start]; flowPaths[i] = [start]; playSound("click"); break; }
+                                else if (cell[0] === end[0] && cell[1] === end[1]) { flowActiveColor = i; flowActivePath = [end]; flowPaths[i] = [end]; playSound("click"); break; }
+                            }
+                        }
+                    }
+                }
+            } else if (currentState === "tictactoe") {
+                if (ticOver) { resetTic(); return; }
+                if (y < HEIGHT * 0.06 && x < WIDTH * 0.22) { currentState = "games_menu"; return; }
+                if (ticTurn === "X") {
+                    let gx = Math.floor((x - ticOffsetX) / ticCell);
+                    let gy = Math.floor((y - ticOffsetY) / ticCell);
+                    if (gx >= 0 && gx < 3 && gy >= 0 && gy < 3 && ticBoard[gy][gx] === "") {
+                        ticBoard[gy][gx] = "X"; playSound("click");
+                        let winner = checkTicWinner(ticBoard);
+                        if (winner) { ticOver = true; ticWinner = winner; playSound(winner === "X" ? "win" : "gameover"); }
+                        else {
+                            ticTurn = "O"; botMove(); playSound("place");
+                            winner = checkTicWinner(ticBoard);
+                            if (winner) { ticOver = true; ticWinner = winner; playSound(winner === "X" ? "win" : "gameover"); }
+                            else ticTurn = "X";
+                        }
+                    }
+                }
+            }
+        }
+
+        function handleInputMove(x, y) {
+            if (currentState === "block" && isDragging && activePiece && !blockGameOver) {
+                activePiece.x = x - (activePiece.cols * CELL_SIZE) / 2;
+                activePiece.y = y - (activePiece.rows * CELL_SIZE) / 2 - 95;
+            } else if (currentState === "line" && flowActiveColor !== null) {
+                let gx = Math.floor((x - flowOffsetX) / flowCell);
+                let gy = Math.floor((y - flowOffsetY) / flowCell);
+                if (gx >= 0 && gx < FLOW_GRID && gy >= 0 && gy < FLOW_GRID) {
+                    let cell = [gx, gy];
+                    let last = flowActivePath[flowActivePath.length - 1];
+                    if (last && (cell[0] !== last[0] || cell[1] !== last[1]) && !flowActivePath.some(p => p[0] === gx && p[1] === gy)) {
+                        if (Math.abs(cell[0] - last[0]) + Math.abs(cell[1] - last[1]) === 1) {
+                            let occupied = flowPaths.some((path, i) => i !== flowActiveColor && path.some(p => p[0] === gx && p[1] === gy));
+                            if (!occupied) {
+                                let start = flowPairs[flowActiveColor][0], end = flowPairs[flowActiveColor][1];
+                                let target = (flowActivePath[0][0] === start[0] && flowActivePath[0][1] === start[1]) ? end : start;
+                                flowActivePath.push(cell); flowPaths[flowActiveColor] = [...flowActivePath]; playSound("click");
+                                if (cell[0] === target[0] && cell[1] === target[1]) {
+                                    flowActiveColor = null; flowActivePath = [];
+                                    if (flowPaths.every(p => p.length >= 2)) { flowWon = true; playSound("win"); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function handleInputEnd(x, y) {
+            if (currentState === "block" && isDragging && activePiece && !blockGameOver) {
+                let gx = Math.round((activePiece.x - GRID_OFFSET_X) / CELL_SIZE);
+                let gy = Math.round((activePiece.y - GRID_OFFSET_Y) / CELL_SIZE);
+                let sh = activePiece.rows, sw = activePiece.cols;
+                let canPlace = true;
+                if (gx >= 0 && gx <= GRID_SIZE - sw && gy >= 0 && gy <= GRID_SIZE - sh) {
+                    for (let r = 0; r < sh; r++) {
+                        for (let c = 0; c < sw; c++) {
+                            if (activePiece.shape[r][c] && blockGrid[gy + r][gx + c] !== 0) canPlace = false;
+                        }
+                    }
+                } else canPlace = false;
+
+                if (canPlace) {
+                    for (let r = 0; r < sh; r++) {
+                        for (let c = 0; c < sw; c++) {
+                            if (activePiece.shape[r][c]) {
+                                blockGrid[gy + r][gx + c] = 1;
+                                blockGridColors[gy + r][gx + c] = activePiece.color;
+                            }
+                        }
+                    }
+                    availablePieces = availablePieces.filter(p => p !== activePiece);
+                    score += 10; playSound("place");
+
+                    let rtc = [], ctc = [];
+                    for (let r = 0; r < GRID_SIZE; r++) if (blockGrid[r].every(cell => cell !== 0)) rtc.push(r);
+                    for (let c = 0; c < GRID_SIZE; c++) {
+                        let full = true;
+                        for (let r = 0; r < GRID_SIZE; r++) if (blockGrid[r][c] === 0) full = false;
+                        if (full) ctc.push(c);
+                    }
+                    let linesCount = rtc.length + ctc.length;
+                    if (linesCount > 0) playSound("clear", linesCount);
+
+                    for (let r of rtc) {
+                        for (let c = 0; c < GRID_SIZE; c++) {
+                            if (blockGridColors[r][c]) {
+                                let cx = GRID_OFFSET_X + c * CELL_SIZE + CELL_SIZE / 2;
+                                let cy = GRID_OFFSET_Y + r * CELL_SIZE + CELL_SIZE / 2;
+                                for (let i = 0; i < 4; i++) particles.push(new Particle(cx, cy, blockGridColors[r][c]));
+                            }
+                        }
+                    }
+                    for (let r of rtc) { blockGrid[r].fill(0); blockGridColors[r].fill(null); score += 100; }
+                    for (let c of ctc) { for (let r = 0; r < GRID_SIZE; r++) { blockGrid[r][c] = 0; blockGridColors[r][c] = null; } score += 100; }
+
+                    if (availablePieces.length === 0) availablePieces = spawnPieces();
+                    if (checkGameOver()) { blockGameOver = true; playSound("gameover"); }
+                } else {
+                    activePiece.resetPosition();
+                }
+                isDragging = false; activePiece = null;
+            } else if (currentState === "line" && flowActiveColor !== null) {
+                flowPaths[flowActiveColor] = []; flowActivePath = []; flowActiveColor = null; playSound("click");
+            } else if (currentState === "snake" && swipeStart) {
+                let dx = x - swipeStart.x, dy = y - swipeStart.y;
+                if (Math.abs(dx) > 30 || Math.abs(dy) > 30) {
+                    if (Math.abs(dx) > Math.abs(dy)) {
+                        if (dx > 0 && snakeDir !== "LEFT") snakeDir = "RIGHT";
+                        else if (dx < 0 && snakeDir !== "RIGHT") snakeDir = "LEFT";
+                    } else {
+                        if (dy > 0 && snakeDir !== "UP") snakeDir = "DOWN";
+                        else if (dy < 0 && snakeDir !== "DOWN") snakeDir = "UP";
+                    }
+                }
+                swipeStart = null;
+            }
+        }
+
+        // Обработчики событий
+        canvas.addEventListener('mousedown', e => handleInputStart(e.clientX, e.clientY));
+        canvas.addEventListener('mousemove', e => handleInputMove(e.clientX, e.clientY));
+        canvas.addEventListener('mouseup', e => handleInputEnd(e.clientX, e.clientY));
+
+        canvas.addEventListener('touchstart', e => { e.preventDefault(); handleInputStart(e.touches[0].clientX, e.touches[0].clientY); }, {passive: false});
+        canvas.addEventListener('touchmove', e => { e.preventDefault(); handleInputMove(e.touches[0].clientX, e.touches[0].clientY); }, {passive: false});
+        canvas.addEventListener('touchend', e => { e.preventDefault(); let t = e.changedTouches[0]; handleInputEnd(t.clientX, t.clientY); }, {passive: false});
+
+        // --- ИГРОВОЙ ЦИКЛ И ОТРИСОВКА ---
+        function drawText(text, x, y, size, color, bold = false) {
+            ctx.fillStyle = color;
+            ctx.font = `${bold ? 'bold ' : ''}${size}px Arial, sans-serif`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(text, x, y);
+        }
+
+        function drawButton(text, rect, color) {
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.roundRect(rect.x, rect.y, rect.w, rect.h, 15);
+            ctx.fill();
+            drawText(text, rect.x + rect.w / 2, rect.y + rect.h / 2, rect.h * 0.4, "#ffffff", true);
+        }
+
+        function gameLoop(timestamp) {
+            const dt = timestamp - lastTime;
+            lastTime = timestamp;
+
+            ctx.fillStyle = BG_COLOR;
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            if (currentState === "menu") {
+                drawText("GAME HUB", WIDTH / 2, HEIGHT * 0.15, WIDTH * 0.12, SCORE_COLOR, true);
+                drawButton("BLOCK BLAST", {x: WIDTH*0.15, y: HEIGHT*0.4, w: WIDTH*0.7, h: HEIGHT*0.09}, "#3498db");
+                drawButton("ДРУГИЕ ИГРЫ", {x: WIDTH*0.15, y: HEIGHT*0.55, w: WIDTH*0.7, h: HEIGHT*0.09}, "#9b59b6");
+            } 
+            else if (currentState === "games_menu") {
+                drawButton("ЗМЕЙКА", {x: WIDTH*0.15, y: HEIGHT*0.22, w: WIDTH*0.7, h: HEIGHT*0.08}, "#2ecc71");
+                drawButton("СУЕФА (КНБ)", {x: WIDTH*0.15, y: HEIGHT*0.33, w: WIDTH*0.7, h: HEIGHT*0.08}, "#e67e22");
+                drawButton("СОЕДИНИ ЛИНИЯМИ", {x: WIDTH*0.15, y: HEIGHT*0.44, w: WIDTH*0.7, h: HEIGHT*0.08}, "#3498db");
+                drawButton("КРЕСТИКИ-НОЛИКИ", {x: WIDTH*0.15, y: HEIGHT*0.55, w: WIDTH*0.7, h: HEIGHT*0.08}, "#9b59b6");
+                drawButton("НАЗАД", {x: WIDTH*0.25, y: HEIGHT*0.72, w: WIDTH*0.5, h: HEIGHT*0.07}, "#95a5a6");
+            }
+            else if (currentState === "block") {
+                // Отрисовка сетки
+                for (let r = 0; r < GRID_SIZE; r++) {
+                    for (let c = 0; c < GRID_SIZE; c++) {
+                        let rx = GRID_OFFSET_X + c * CELL_SIZE;
+                        let ry = GRID_OFFSET_Y + r * CELL_SIZE;
+                        if (blockGrid[r][c] === 0) {
+                            ctx.fillStyle = GRID_EMPTY;
+                            ctx.beginPath(); ctx.roundRect(rx, ry, CELL_SIZE, CELL_SIZE, 4); ctx.fill();
+                            ctx.strokeStyle = GRID_BORDER; ctx.lineWidth = 1;
+                            ctx.beginPath(); ctx.roundRect(rx, ry, CELL_SIZE, CELL_SIZE, 4); ctx.stroke();
+                        } else {
+                            ctx.fillStyle = blockGridColors[r][c] || GRID_EMPTY;
+                            ctx.beginPath(); ctx.roundRect(rx + 1, ry + 1, CELL_SIZE - 2, CELL_SIZE - 2, 6); ctx.fill();
+                        }
+                    }
+                }
+                // Частицы
+                particles.forEach((p, i) => { p.update(); p.draw(); if (p.alpha <= 0) particles.splice(i, 1); });
+                // Фигуры
+                availablePieces.forEach(p => { if (p !== activePiece) p.draw(); });
+                if (activePiece) activePiece.draw();
+                
+                // Интерфейс
+                drawButton("МЕНЮ", {x: 15, y: 15, w: WIDTH*0.22, h: HEIGHT*0.04}, "#2a3242");
+                drawText(`SCORE: ${score}`, WIDTH / 2, HEIGHT * 0.03, WIDTH * 0.08, SCORE_COLOR);
+                drawText(`BEST: ${localStorage.getItem('blockHighScore') || 0}`, WIDTH / 2, HEIGHT * 0.08, WIDTH * 0.08, "#f39c12");
+                if (score > (localStorage.getItem('blockHighScore') || 0)) localStorage.setItem('blockHighScore', score);
+
+                if (blockGameOver) {
+                    ctx.fillStyle = OVERLAY_COLOR; ctx.fillRect(0, 0, WIDTH, HEIGHT);
+                    drawText("GAME OVER", WIDTH / 2, HEIGHT / 2 - 100, WIDTH * 0.15, "#e74c3c", true);
+                    drawButton("RESTART", {x: WIDTH*0.25, y: HEIGHT/2 + 20, w: WIDTH*0.5, h: HEIGHT*0.08}, "#2ecc71");
+                }
+            }
+            else if (currentState === "snake") {
+                if (!snakeOver) {
+                    if (dt > 1000 / 7) { // Скорость змейки
+                        let head = [...snakePos[0]];
+                        if (snakeDir === "RIGHT") head[0] += snakeCell;
+                        else if (snakeDir === "LEFT") head[0] -= snakeCell;
+                        else if (snakeDir === "UP") head[1] -= snakeCell;
+                        else if (snakeDir === "DOWN") head[1] += snakeCell;
+                        
+                        snakePos.unshift(head);
+                        if (head[0] === snakeFood[0] && head[1] === snakeFood[1]) {
+                            snakeScore += 10; playSound("click"); spawnSnakeFood();
+                        } else snakePos.pop();
+
+                        let topLimit = HEIGHT * 0.12, bottomLimit = HEIGHT - HEIGHT * 0.1;
+                        if (head[0] < 0 || head[0] >= WIDTH || head[1] < topLimit || head[1] >= bottomLimit || snakePos.slice(1).some(s => s[0] === head[0] && s[1] === head[1])) {
+                            snakeOver = true; playSound("gameover");
+                        }
+                    }
+                }
+                // Отрисовка
+                if (snakeFood) {
+                    ctx.fillStyle = "#e74c3c";
+                    ctx.beginPath(); ctx.roundRect(snakeFood[0], snakeFood[1], snakeCell - 2, snakeCell - 2, 4); ctx.fill();
+                }
+                snakePos.forEach(s => {
+                    ctx.fillStyle = "#2ecc71";
+                    ctx.beginPath(); ctx.roundRect(s[0], s[1], snakeCell - 2, snakeCell - 2, 4); ctx.fill();
+                });
+                ctx.fillStyle = GRID_EMPTY; ctx.fillRect(0, 0, WIDTH, HEIGHT * 0.12);
+                drawText(`SCORE: ${snakeScore}`, WIDTH / 2, HEIGHT * 0.06, WIDTH * 0.06, SCORE_COLOR, true);
+                drawButton("НАЗАД", {x: 15, y: 15, w: WIDTH*0.22, h: HEIGHT*0.04}, "#424d63");
+                
+                if (snakeOver) drawText("ТАП ДЛЯ РЕСТАРТА", WIDTH / 2, HEIGHT / 2, WIDTH * 0.08, "#e74c3c", true);
+            }
+            else if (currentState === "suiefa") {
+                drawButton("НАЗАД", {x: 15, y: 15, w: WIDTH*0.22, h: HEIGHT*0.04}, "#2a3242");
+                drawText(`${suiefaPlayerScore} : ${suiefaBotScore}`, WIDTH / 2, HEIGHT * 0.15, WIDTH * 0.14, "#ffffff", true);
+                drawText(suiefaStatusText, WIDTH / 2, HEIGHT * 0.28, WIDTH * 0.05, SCORE_COLOR, true);
+                drawText(suiefaResultText, WIDTH / 2, HEIGHT * 0.36, WIDTH * 0.08, suiefaResultText.includes("ВЫ") || suiefaResultText.includes("ПОБЕДА") ? "#2ecc71" : "#e74c3c", true);
+                
+                if (!suiefaOver) {
+                    for (let i = 0; i < 3; i++) {
+                        drawButton(suiefaChoices[i], {x: WIDTH*0.15, y: HEIGHT*0.48 + i*HEIGHT*0.09, w: WIDTH*0.7, h: HEIGHT*0.07}, "#3498db");
+                    }
+                } else {
+                    drawButton("ИГРАТЬ СНОВА", {x: WIDTH*0.2, y: HEIGHT*0.8, w: WIDTH*0.6, h: HEIGHT*0.07}, "#2ecc71");
+                }
+            }
+            else if (currentState === "line") {
+                // Кнопки
+                drawButton("НАЗАД", {x: 15, y: 15, w: WIDTH*0.22, h: HEIGHT*0.04}, "#2a3242");
+                drawButton("СБРОС", {x: WIDTH - WIDTH*0.4, y: HEIGHT*0.02, w: WIDTH*0.18, h: HEIGHT*0.05}, "#e67e22");
+                drawButton("НОВЫЙ", {x: WIDTH - WIDTH*0.2, y: HEIGHT*0.02, w: WIDTH*0.18, h: HEIGHT*0.05}, "#2ecc71");
+                drawText("СОЕДИНИ ЛИНИЯМИ", WIDTH / 2, HEIGHT * 0.09, WIDTH * 0.05, SCORE_COLOR, true);
+
+                // Сетка
+                for (let r = 0; r < FLOW_GRID; r++) {
+                    for (let c = 0; c < FLOW_GRID; c++) {
+                        let rx = flowOffsetX + c * flowCell, ry = flowOffsetY + r * flowCell;
+                        ctx.fillStyle = GRID_EMPTY; ctx.beginPath(); ctx.roundRect(rx, ry, flowCell, flowCell, 4); ctx.fill();
+                        ctx.strokeStyle = GRID_BORDER; ctx.lineWidth = 1; ctx.beginPath(); ctx.roundRect(rx, ry, flowCell, flowCell, 4); ctx.stroke();
+                    }
+                }
+                // Пути
+                let drawPath = (path, color) => {
+                    if (path.length >= 2) {
+                        ctx.strokeStyle = color; ctx.lineWidth = flowCell / 4; ctx.lineCap = "round"; ctx.lineJoin = "round";
+                        ctx.beginPath();
+                        ctx.moveTo(flowOffsetX + path[0][0]*flowCell + flowCell/2, flowOffsetY + path[0][1]*flowCell + flowCell/2);
+                        for (let i = 1; i < path.length; i++) ctx.lineTo(flowOffsetX + path[i][0]*flowCell + flowCell/2, flowOffsetY + path[i][1]*flowCell + flowCell/2);
+                        ctx.stroke();
+                    }
+                };
+                flowPaths.forEach((path, i) => drawPath(path, FLOW_COLORS[i]));
+                if (flowActivePath.length >= 2) drawPath(flowActivePath, FLOW_COLORS[flowActiveColor]);
+
+                // Точки
+                flowPairs.forEach((pair, i) => {
+                    [pair[0], pair[1]].forEach(pt => {
+                        let cx = flowOffsetX + pt[0]*flowCell + flowCell/2;
+                        let cy = flowOffsetY + pt[1]*flowCell + flowCell/2;
+                        ctx.fillStyle = FLOW_COLORS[i]; ctx.beginPath(); ctx.arc(cx, cy, flowCell/3, 0, Math.PI*2); ctx.fill();
+                        ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.stroke();
+                    });
+                });
+
+                if (flowWon) drawText("ПРОЙДЕНО! ТАП ДЛЯ НОВОГО УРОВНЯ", WIDTH / 2, HEIGHT / 2, WIDTH * 0.06, "#2ecc71", true);
+            }
+            else if (currentState === "tictactoe") {
+                drawButton("НАЗАД", {x: 15, y: 15, w: WIDTH*0.22, h: HEIGHT*0.04}, "#2a3242");
+                drawText("КРЕСТИКИ-НОЛИКИ", WIDTH / 2, HEIGHT * 0.04, WIDTH * 0.05, SCORE_COLOR, true);
+                
+                for (let r = 0; r < TIC_SIZE; r++) {
+                    for (let c = 0; c < TIC_SIZE; c++) {
+                        let rx = ticOffsetX + c * ticCell, ry = ticOffsetY + r * ticCell;
+                        ctx.fillStyle = GRID_EMPTY; ctx.beginPath(); ctx.roundRect(rx, ry, ticCell, ticCell, 8); ctx.fill();
+                        ctx.strokeStyle = GRID_BORDER; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(rx, ry, ticCell, ticCell, 8); ctx.stroke();
+
+                        if (ticBoard[r][c] === "X") {
+                            let m = ticCell / 4;
+                            ctx.strokeStyle = "#3498db"; ctx.lineWidth = 6;
+                            ctx.beginPath(); ctx.moveTo(rx + m, ry + m); ctx.lineTo(rx + ticCell - m, ry + ticCell - m); ctx.stroke();
+                            ctx.beginPath(); ctx.moveTo(rx + ticCell - m, ry + m); ctx.lineTo(rx + m, ry + ticCell - m); ctx.stroke();
+                        } else if (ticBoard[r][c] === "O") {
+                            ctx.strokeStyle = "#e74c3c"; ctx.lineWidth = 6;
+                            ctx.beginPath(); ctx.arc(rx + ticCell/2, ry + ticCell/2, ticCell/3, 0, Math.PI*2); ctx.stroke();
+                        }
+                    }
+                }
+                if (ticOver) {
+                    let txt = ticWinner === "X" ? "ТЫ ВЫИГРАЛ! ТАП ДЛЯ РЕСТАРТА" : ticWinner === "O" ? "БОТ ВЫИГРАЛ! ТАП ДЛЯ РЕСТАРТА" : "НИЧЬЯ! ТАП ДЛЯ РЕСТАРТА";
+                    let col = ticWinner === "X" ? "#2ecc71" : ticWinner === "O" ? "#e74c3c" : "#f1c40f";
+                    drawText(txt, WIDTH / 2, HEIGHT * 0.85, WIDTH * 0.06, col, true);
+                }
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Запуск
+        requestAnimationFrame(gameLoop);
+        
+        // Регистрация Service Worker для PWA (офлайн-режим)
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js').then(reg => {
+                    console.log('SW registered', reg);
+                }).catch(err => {
+                    console.log('SW registration failed', err);
+                });
+            });
+        }
+    </script>
+</body>
+</html>
